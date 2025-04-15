@@ -3,16 +3,33 @@ from mesa.space import MultiGrid
 import numpy as np
 import random
 import pygame
+import os
+import pickle
+
+if not os.path.exists("q_tables"):
+    os.makedirs("q_tables")
+
 
 ACTIONS = [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (-1, -1), (1, -1), (-1, 1), (0, 0)]
 LEARNING_RATE = 0.1
 DISCOUNT_FACTOR = 0.9
-EPSILON = 0.1
+EPSILON = 0.3
 
 class QLearningAgent(Agent):
     def __init__(self, model):
         super().__init__(model)
-        self.q_table = {} 
+        self.q_table = {}
+
+    def save_q_table(self, filename):
+        with open(filename, 'wb') as f:
+            pickle.dump(self.q_table, f)
+
+    def load_q_table(self, filename):
+        try:
+            with open(filename, 'rb') as f:
+                self.q_table = pickle.load(f)
+        except FileNotFoundError:
+            self.q_table = {} 
 
     def get_state(self):
         return self.pos
@@ -35,17 +52,40 @@ class QLearningAgent(Agent):
         future_value = max(self.q_table[next_state])
         new_value = old_value + LEARNING_RATE * (reward + DISCOUNT_FACTOR * future_value - old_value)
         self.q_table[state][action_index] = new_value
+    
+    def perceive_environment(self):
+        visibility_range = self.model.get_visibility_range()
+        visible_agents = []
 
+        for dx in range(-visibility_range, visibility_range + 1):
+            for dy in range(-visibility_range, visibility_range + 1):
+                if abs(dx) + abs(dy) > visibility_range:  
+                    continue
+                nx, ny = self.pos[0] + dx, self.pos[1] + dy
+
+                if self.model.grid.out_of_bounds((nx, ny)):
+                    continue
+
+                cell_contents = self.model.grid.get_cell_list_contents([(nx, ny)])
+                for obj in cell_contents:
+                    if obj is not self:
+                        visible_agents.append(obj)
+
+        return visible_agents
+    
 class Ship(QLearningAgent):
     def __init__(self, model):
         super().__init__(model)
         self.has_cargo = False
+        self.load_q_table(f'q_tables/ship_{self.unique_id}.pkl')
         
     def step(self):
         if self.has_cargo:
             print("I have cargo")
         else:
             print("I have nothing")
+
+        visible = self.perceive_environment()
         state = self.get_state()
         action = self.choose_action()
         new_pos = (max(0, min(self.pos[0] + action[0], self.model.grid.width - 1)),
@@ -56,31 +96,38 @@ class Ship(QLearningAgent):
             self.model.grid.move_agent(self, new_pos)
             if new_pos == self.model.docks[0] and not self.has_cargo:
                 self.has_cargo = True
-                reward = 20  # Reward for picking up cargo
+                reward += 500  # Reward for picking up cargo
             elif new_pos == self.model.docks[1]:
                 if self.has_cargo:
                     self.has_cargo = False
-                    reward = 20  # Reward for successful delivery
+                    reward += 20  # Reward for successful delivery
                 else:
-                    reward = -5  # Penalty for arriving without cargo
+                    reward -= 1000  # Penalty for arriving without cargo
+            
+            if self.has_cargo:
+                reward += 2
 
 
         for agent in self.model.grid.get_cell_list_contents([new_pos]):
             if isinstance(agent, Pirate):
-                reward = -5  # Penalized for being attacked by pirate
+                reward -= 10  # Penalized for being attacked by pirate
 
         self.update_q_value(state, action, reward, self.get_state())
+        self.save_q_table(f'q_tables/ship_{self.unique_id}.pkl')
+
 
 class Pirate(QLearningAgent):
     def __init__(self, model):
         super().__init__(model)
         self.captured_steps = 0
+        self.load_q_table(f'q_tables/pirate_{self.unique_id}.pkl')
 
     def step(self):
         if self.captured_steps > 0:
             self.captured_steps -= 1
-            return  
-        
+            return 
+         
+        visible = self.perceive_environment()
         state = self.get_state()
         action = self.choose_action()
         new_pos = (max(0, min(self.pos[0] + action[0], self.model.grid.width - 1)),
@@ -92,17 +139,23 @@ class Pirate(QLearningAgent):
 
         for agent in self.model.grid.get_cell_list_contents([new_pos]):
             if isinstance(agent, Ship) and agent.has_cargo:
-                reward = 10  # Reward for stealing cargo
+                reward += 10  # Reward for stealing cargo
                 agent.has_cargo = False
             if isinstance(agent, Security):
-                reward = -10  # Penalized for being caught
-                self.captured_steps = 10
+                reward += 10  # Penalized for being caught
+                self.captured_steps += 10
                 self.model.grid.move_agent(self, (random.randint(0, self.model.grid.width-1), random.randint(0, self.model.grid.height-1)))
 
         self.update_q_value(state, action, reward, self.get_state())
+        self.save_q_table(f'q_tables/pirate_{self.unique_id}.pkl')
 
 class Security(QLearningAgent):
+    def __init__(self, model):
+        super().__init__(model)
+        self.load_q_table(f'q_tables/security_{self.unique_id}.pkl')
+
     def step(self):
+        visible = self.perceive_environment()
         state = self.get_state()
         action = self.choose_action()
         new_pos = (max(0, min(self.pos[0] + action[0], self.model.grid.width - 1)),
@@ -114,9 +167,10 @@ class Security(QLearningAgent):
 
         for agent in self.model.grid.get_cell_list_contents([new_pos]):
             if isinstance(agent, Pirate):
-                reward = 10  # Reward for catching pirate
+                reward += 10  # Reward for catching pirate
 
         self.update_q_value(state, action, reward, self.get_state())
+        self.save_q_table(f'q_tables/security_{self.unique_id}.pkl')
 
 class PortSecurityModel(Model):
     def __init__(self, width, height, num_ships, num_pirates, num_security):
@@ -126,6 +180,9 @@ class PortSecurityModel(Model):
         self.ships = []
         self.pirates = []
         self.securities = []
+        self.weather = "sunny"
+        self.weather_states = ["sunny", "cloudy", "rainy", "stormy"]
+        self.weather_counter = 0
 
         for _ in range(num_ships):
             ship = Ship(self)
@@ -141,8 +198,20 @@ class PortSecurityModel(Model):
             security = Security(self)
             self.securities.append(security)
             self.grid.place_agent(security, (random.randint(0, width-1), random.randint(0, height-1)))
+    
+    def update_weather(self):
+        self.weather = random.choices(self.weather_states, weights=[0.4, 0.3, 0.2, 0.1], k=1)[0]
+    
+    def get_visibility_range(self):
+        return {"sunny": 4,"cloudy": 3,"rainy": 2,"stormy": 1}[self.weather]
 
     def step(self):
+        if self.weather_counter >= 5:
+            self.update_weather()
+            self.weather_counter = 0
+        else:
+            self.weather_counter += 1
+        
         self.agents.shuffle_do("step")
 
 
